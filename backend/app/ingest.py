@@ -1,50 +1,85 @@
-import os 
+import os
 from pathlib import Path
+
 from dotenv import load_dotenv
-from tenacity import retry, wait_exponential
-from openai import OpenAI
-from pydantic import BaseModel, Field
+
+from langchain_community.document_loaders import DirectoryLoader, TextLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_chroma import Chroma
+from langchain_huggingface import HuggingFaceEmbeddings
 
 load_dotenv(override=True)
 
-MODEL = os.getenv("LLM_MODEL")
+BASE_DIR = Path(__file__).resolve().parent.parent
 
-BASE_DIR=Path(__file__).resolve().parent.parent
+DB_NAME = str(BASE_DIR / "preprocessed_db")
+KNOWLEDGE_BASE_PATH = str(BASE_DIR / "knowledge-base")
 
-DB_NAME=str(BASE_DIR/"preprocessed_db")
-COLLECTION_NAME = "docs"
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL")
-KNOWLEDGE_BASE_PATH = BASE_DIR / "knowledge-base"
-AVERAGE_CHUNK_SIZE=100
+embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
 
-wait = wait_exponential(multiplier=1, min=10, max=240)
 
-openai=OpenAI()
-
-class Result(BaseModel):
-    page_content:str
-    metadata:dict
-    
-class Chunk(BaseModel):
-    headline:str=Field(
-        description="A brief heading for this chunk, typically a few words, that is most likely to be surfaced in a query",
+def fetch_documents():
+    loader = DirectoryLoader(
+        KNOWLEDGE_BASE_PATH,
+        glob="*.md",
+        loader_cls=TextLoader,
+        loader_kwargs={"encoding": "utf-8"},
     )
-    summary:str=Field(
-        description="A few sentences summarizing the content of this chunk to answer common questions"
+
+    documents = loader.load()
+
+    print(f"Loaded {len(documents)} documents")
+
+    return documents
+
+
+def create_chunks(documents):
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=500,
+        chunk_overlap=150,
     )
-    original_text:str=Field(
-        description="The original text of this chunk from the provided document, exactly as is, not changed in any way"
+
+    chunks = splitter.split_documents(documents)
+
+    print(f"Created {len(chunks)} chunks")
+
+    return chunks
+
+
+def create_embeddings(chunks):
+
+    if os.path.exists(DB_NAME):
+        Chroma(
+            persist_directory=DB_NAME,
+            embedding_function=embeddings,
+        ).delete_collection()
+
+    vectorstore = Chroma.from_documents(
+        documents=chunks,
+        embedding=embeddings,
+        persist_directory=DB_NAME,
     )
-    
-    def as_result(self, document):
-        metadata={"source":document["source"], "type":document["type"]}
-        return Result(
-            page_content=self.headline + "\n\n" + self.summary + "\n\n" + self.original_text,
-            metadata=metadata,
-        )
-        
-class Chunks(BaseModel):
-    chunks:list[Chunk]
-    
+
+    collection = vectorstore._collection
+
+    count = collection.count()
+
+    sample_embedding = collection.get(
+        limit=1,
+        include=["embeddings"],
+    )["embeddings"][0]
+
+    dimensions = len(sample_embedding)
+
+    print(
+        f"There are {count:,} vectors with {dimensions:,} dimensions in the vector store."
+    )
+
+    return vectorstore
+
+
 if __name__ == "__main__":
-    print("HI")
+    documents = fetch_documents()
+    chunks = create_chunks(documents)
+    create_embeddings(chunks)
+    print("Ingestion complete.")
